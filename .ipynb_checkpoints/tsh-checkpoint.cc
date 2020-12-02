@@ -146,6 +146,7 @@ int main(int argc, char *argv[])
 // background children don't receive SIGINT (SIGTSTP) from the kernel
 // when we type ctrl-c (ctrl-z) at the keyboard.
 //
+
 void eval(char *cmdline) 
 {
   /* Parse command line */
@@ -154,20 +155,45 @@ void eval(char *cmdline)
   // routine below. It provides the arguments needed
   // for the execve() routine, which you'll need to
   // use below to launch a process.
-  //
-  char *argv[MAXARGS];
-
-  //
+	char *argv[MAXARGS];
+    
   // The 'bg' variable is TRUE if the job should run
   // in background mode or FALSE if it should run in FG
-  //
-  int bg = parseline(cmdline, argv); 
-  if (argv[0] == NULL)  
-    return;   /* ignore empty lines */
+	int bg = parseline(cmdline, argv); //returns true if bg job, false if foreground job
+	
+    if (argv[0] == NULL){  
+	 return;   /* ignore empty lines */
+	}
+    
+    pid_t pid;
+	struct job_t *job;
+ 
+    //check if it is a builtin_cmd
+    //if it is, process it with our builtin_cmd function
+    //if not, fork and exec a child process
+	if (!builtin_cmd(argv)){	
+		pid = fork();
+		setpgid(0,0); //sets group id for the fg processes to distinguish from bg processes
+		if(pid == 0){ //if the return value of the fork is 0, it tells us that we are within the child process
+			execv(argv[0], argv); //execv replaces currently executing program with newly loaded program image into child process (PID unchanged)
+			printf("%s: Command not found\n", argv[0]);//gives a negative value if the command is not found, exit so it does not run multiple instances of the shell
+			exit(0); //return if command does not make sense		 
+		}		
+		else{ //if parent			
+			if(!bg){ //will execute if in the an FG process (bg is false)
+				addjob(jobs, pid, FG, cmdline);	//add job to struct with fg state
+				waitfg(pid); //make the parent process and wait for the child process and reap it (race avoidance)	
+					}
+			else{
+				addjob(jobs, pid, BG, cmdline); //add job to struct with bg state				
+				job = getjobpid(jobs, pid);	//get job id of recently added job
+				printf("[%d] (%d) %s", job->jid, pid, cmdline);
+			}
 
-  return;
-}
-
+		}
+	}	
+	  return;
+	}
 
 /////////////////////////////////////////////////////////////////////////////
 //
@@ -179,10 +205,20 @@ void eval(char *cmdline)
 //
 int builtin_cmd(char **argv) 
 {
-  string cmd(argv[0]);
-  return 0;     /* not a builtin command */
-}
-
+  string input(argv[0]); //dont have to strcmpr for every if statement
+  if (input == "quit"){ //quit command
+	exit(0);
+	}		
+  else if((strcmp(argv[0],"bg")) == 0 || (strcmp(argv[0],"fg") == 0)){ //bg or fg command, passes to do_bgfg function
+  	do_bgfg(argv);
+  	return 1;
+  }
+  else if (input == "jobs"){
+	listjobs(jobs); //call list jobs function
+	return 1;
+	}				
+  return 0;     //the shell creates a child process and executes the requested program inside the child if it returns 0
+}		
 /////////////////////////////////////////////////////////////////////////////
 //
 // do_bgfg - Execute the builtin bg and fg commands
@@ -227,7 +263,16 @@ void do_bgfg(char **argv)
   // your benefit.
   //
   string cmd(argv[0]);
-
+  if((strcmp(argv[0],"bg")) == 0)  {
+  	jobp->state = BG; //changes the state to bg
+  	kill(-jobp->pid, SIGCONT); //tells the system to run the job again
+  	printf("[%d] (%d) %s", jobp->jid, jobp->pid, jobp->cmdline);
+  }
+  if((strcmp(argv[0],"fg")) == 0)  {
+  	jobp->state = FG; //changes the state to bg
+  	kill(-jobp->pid, SIGCONT); //tells the system to run the job again
+  	waitfg(jobp->pid); //uses waitfg because it can only have only one fg process running at a time
+  }
   return;
 }
 
@@ -237,6 +282,9 @@ void do_bgfg(char **argv)
 //
 void waitfg(pid_t pid)
 {
+	while(pid == fgpid(jobs)){ //when it is not a fg pid stop sleeping
+		sleep(.1);
+	}
   return;
 }
 
@@ -254,9 +302,30 @@ void waitfg(pid_t pid)
 //     available zombie children, but doesn't wait for any other
 //     currently running children to terminate.  
 //
-void sigchld_handler(int sig) 
+//1. 
+void sigchld_handler(int sig)
 {
-  return;
+	int status;
+	pid_t pid;
+    //use waitpid to wait until that child is done executing
+	while((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0){ 
+		if(WIFSTOPPED(status)){ //if the process is stopped (WIFSTOPPED == TRUE), change the state to stopped 
+			struct job_t *job = getjobpid(jobs, pid); 
+  			job->state = ST;
+			printf("Job [%d] (%d) stopped by signal 20\n", job->jid, pid);
+			return;
+		}
+		else if(WIFSIGNALED(status)){ //catches ctrl-c, the interupt signal which has a default action of terminate
+			struct job_t *job = getjobpid(jobs, pid); //used for print statement
+			printf("Job [%d] (%d) terminated by signal 2\n", job->jid, pid);
+			deletejob(jobs, pid);
+		}
+		else{		
+ 			deletejob(jobs, pid);
+ 			}
+ 		}		
+	return; 
+												
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -267,7 +336,11 @@ void sigchld_handler(int sig)
 //
 void sigint_handler(int sig) 
 {
-  return;
+	pid_t pid = fgpid(jobs);
+	if (pid > 0){ //to be a fg job the pid has to be greater than 0
+		kill(-pid, sig); //kill the process (default action)
+	}
+	return;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -278,6 +351,10 @@ void sigint_handler(int sig)
 //
 void sigtstp_handler(int sig) 
 {
+  pid_t pid = fgpid(jobs);
+  if(pid > 0){ //to be a fg job the pid has to be greater than 0
+  	kill(-pid, sig); //kill the process (default action)
+  }
   return;
 }
 
